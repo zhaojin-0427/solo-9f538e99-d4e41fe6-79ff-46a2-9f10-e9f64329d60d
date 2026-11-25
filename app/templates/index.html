@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>冷库需量峰值核账</title>
+<title>冷库需量峰值核账（换表接续）</title>
 <style>
-  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; }
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; --warn:#9a6700; }
   * { box-sizing: border-box; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
          margin: 0; padding: 24px; color:#1f2328; }
@@ -15,7 +15,7 @@
   table { border-collapse: collapse; width:100%; font-size:13px; }
   th,td { border:1px solid var(--bd); padding:6px 10px; text-align:left; }
   th { background:var(--bg); }
-  input { padding:6px 8px; border:1px solid var(--bd); border-radius:6px;
+  input,select { padding:6px 8px; border:1px solid var(--bd); border-radius:6px;
           margin-right:12px; }
   button { padding:7px 16px; border:0; border-radius:6px; background:#0969da;
            color:#fff; cursor:pointer; }
@@ -26,14 +26,17 @@
   .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
   .b-feasible { background:#dafbe1; color:var(--ok); }
   .b-target_unreachable, .b-others_breach { background:#ffebe9; color:var(--err); }
+  .b-suspended { background:#fff8c5; color:var(--warn); border:1px solid #d4a72c; }
   .muted { color:#6e7781; font-size:12px; }
   .rep { font-weight:700; background:#fff8c5; }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+  .suspend { border:1px solid #d4a72c; background:#fff8c5; color:var(--warn);
+             padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; }
 </style>
 </head>
 <body>
-<h1>冷库需量账单峰值核账（单表单期）</h1>
+<h1>冷库需量账单峰值核账（同期换表接续）</h1>
 
 {% with messages = get_flashed_messages(with_categories=true) %}
   {% for cat, msg in messages %}
@@ -41,24 +44,119 @@
   {% endfor %}
 {% endwith %}
 
+{% if suspended %}
+<div class="suspend">
+  换表或交接读数已更正：旧的当前结论与 <code>windows.csv</code> 已暂停提供，
+  请用接续值在下方重新核对；核对成功后恢复供数（初核结论始终保留）。
+</div>
+{% endif %}
+
 <div class="card">
-  <h2 style="margin-top:0">1. 上传整分钟累计读数 CSV</h2>
-  <p class="muted">表头 <code>timestamp,reading</code>，整数 Wh，整分钟；账期内可补传，同刻覆盖。
-     合并后若回卷或超每分钟上限无解，整批拒绝，库内数据与结论不变。</p>
+  <h2 style="margin-top:0">1. 补传整分钟累计读数 CSV（选电表使用时段）</h2>
+  <p class="muted">表头 <code>timestamp,reading</code>，整数 Wh，整分钟。
+     使用时段以交接分钟为界、两侧均含该分钟；同一时段同刻覆盖，可分别更正旧表末读和新表起始读数。
+     读数越界，或合并后同一时段回卷、超过原每分钟用电上限，整批拒绝，接续值照旧。</p>
   <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+    <label>电表使用时段
+      <select name="meter_seq">
+        {% for m in meters %}
+        {% set span = spans[m.seq] %}
+        <option value="{{ m.seq }}" {{ 'selected' if m.seq == meters[-1].seq }}>
+          {{ m.meter_id }}{% if m.seq == 0 %}（首表，旧库读数归此表）{% endif %}
+          ｜{% if span[0] %}{{ span[0].strftime('%Y-%m-%d %H:%M') }}{% else %}账期首读{% endif %}
+          →{% if span[1] %}{{ span[1].strftime('%Y-%m-%d %H:%M') }}（含）{% else %}至今{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
     <input type="file" name="csv" accept=".csv,text/csv" required>
     <button type="submit">上传 / 补传</button>
   </form>
   {% if readings %}
-    <p class="muted">当前 {{ readings|length }} 条读数，账期：
+    <p class="muted">接续后 {{ readings|length }} 个分钟点，账期：
       {{ readings[0][0].strftime('%Y-%m-%d %H:%M') }} →
       {{ readings[-1][0].strftime('%Y-%m-%d %H:%M') }}
-      （{{ ((readings[-1][0] - readings[0][0]).total_seconds() / 60)|int }} 分钟）</p>
+      （{{ ((readings[-1][0] - readings[0][0]).total_seconds() / 60)|int }} 分钟）；
+      原始读数 {{ raw_readings|length }} 条，电表 {{ meters|length }} 块，
+      交接 {{ changes|length }} 次（上限 31 次）。</p>
   {% endif %}
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">2. 填写核对参数</h2>
+  <h2 style="margin-top:0">2. 登记换表（现用表末次实读分钟）</h2>
+  <p class="muted">交接须晚于现用表首读；同一期可多次换表。
+     累计值从首表原示数起算，交接分钟两侧读数折算成同一接续值，两侧均含该分钟。
+     登记成功后旧当前结论与 CSV 暂停提供。</p>
+  <form method="post" action="{{ url_for('change_meter') }}">
+    <label>交接分钟（现用表末次实读分钟）
+      <input name="handover_minute" placeholder="2026-11-05 09:30" required></label>
+    <label>新电表编号
+      <input name="new_meter_id" placeholder="M2" required></label>
+    <label>新表起始读数 (Wh)
+      <input name="new_start_reading" type="number" min="0" required></label>
+    <button type="submit">登记换表</button>
+  </form>
+  {% if summary %}
+    <p class="muted">接续汇总：首表 {{ summary.first_meter_id or '—' }}，
+       首表原示数 {{ summary.first_reading if summary.first_reading is not none else '—' }} Wh，
+       已交接 {{ summary.handover_count }} 次；换表记录 {{ changes|length }} 条 +
+       接续汇总 1 条 = {{ changes|length + 1 }} / 32 条。</p>
+  {% endif %}
+</div>
+
+{% if changes %}
+<div class="card">
+  <h2 style="margin-top:0">换表记录与接续折算</h2>
+  <table>
+    <tr><th>序</th><th>交接分钟</th><th>旧表</th><th>旧表末读 (Wh)</th>
+        <th>新表</th><th>新表起始 (Wh)</th><th>统一接续值 (Wh)</th><th>登记时间</th></tr>
+    {% for c in changes %}
+    <tr>
+      <td>{{ c.seq }}</td><td>{{ c.handover_minute }}</td>
+      <td>{{ meters[c.old_meter_seq].meter_id }}</td>
+      <td>{{ c.old_last_reading }}</td>
+      <td>{{ meters[c.new_meter_seq].meter_id }}</td>
+      <td>{{ c.new_start_reading }}</td>
+      <td>{{ c.unified_value }}</td>
+      <td>{{ c.created_ts }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">3. 按分钟查原始读数与接续值</h2>
+  <p class="muted">只读该分钟的实读；换表记录与接续汇总合计最多读 32 条。</p>
+  <form method="get" action="{{ url_for('minute_lookup') }}">
+    <input name="minute" placeholder="2026-11-05 09:30"
+           value="{{ minute_text }}" required>
+    <button type="submit">查询</button>
+  </form>
+  {% if minute_error %}<p class="flash error">{{ minute_error }}</p>{% endif %}
+  {% if lookup %}
+    <table style="margin-top:10px">
+      <tr><th>分钟</th><th>电表</th><th>原始实读 (Wh)</th><th>接续值 (Wh)</th></tr>
+      {% for r in lookup.raw_readings %}
+      <tr>
+        <td>{{ lookup.minute }}</td>
+        <td>{{ r.meter_id }}</td>
+        <td>{{ r.reading_wh }}</td>
+        <td>{{ lookup.continuation_value }}</td>
+      </tr>
+      {% else %}
+      <tr><td>{{ lookup.minute }}</td><td colspan="3" class="muted">该分钟无实读</td></tr>
+      {% endfor %}
+    </table>
+    {% if lookup.meter_change %}
+      <p class="muted">该分钟为交接分钟：统一接续值
+        {{ lookup.meter_change.unified_value }} Wh，两侧均含该分钟。</p>
+    {% endif %}
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">4. 填写核对参数（基于接续值）</h2>
   <form method="post" action="{{ url_for('audit') }}">
     <label>每分钟用电上限 (Wh)
       <input name="per_minute_cap" type="number" min="1" required
@@ -84,7 +182,11 @@
   </div>
   <div class="card">
     <h2 style="margin-top:0">当前结论（随读数/参数更新）</h2>
-    {% if current %}
+    {% if current and suspended %}
+      <span class="badge b-suspended">suspended 已暂停</span>
+      <p>换表或交接读数更正后，本结论与 CSV 暂停提供；重新核对成功后恢复。</p>
+      <p class="muted">原生成于 {{ current.created_ts }}</p>
+    {% elif current %}
       <span class="badge b-{{ current.status }}">{{ current.status }}</span>
       <p>{{ current.message }}</p>
       <p class="muted">生成于 {{ current.created_ts }}</p>
@@ -100,9 +202,9 @@
   </div>
 </div>
 
-{% if windows %}
+{% if windows and not suspended %}
 <div class="card">
-  <h2 style="margin-top:0">3. 全期各 15 分钟时段电量（Wh）</h2>
+  <h2 style="margin-top:0">5. 全期各 15 分钟时段电量（Wh，接续值核对）</h2>
   <p><a href="{{ url_for('windows_csv') }}">导出 windows.csv</a></p>
   <table>
     <tr><th>窗起点</th><th>窗索引</th><th>电量 (Wh)</th><th>所报时段</th></tr>
@@ -116,23 +218,22 @@
 </div>
 {% endif %}
 
-{% if readings %}
+{% if raw_readings %}
 <div class="card">
-  <h2 style="margin-top:0">库内读数</h2>
+  <h2 style="margin-top:0">库内原始读数（按电表）</h2>
   <table>
-    <tr><th>分钟</th><th>累计读数 (Wh)</th></tr>
-    {% for ts, v in readings %}
-    <tr><td>{{ ts.strftime('%Y-%m-%d %H:%M') }}</td><td>{{ v }}</td></tr>
+    <tr><th>分钟</th><th>电表</th><th>原始累计读数 (Wh)</th></tr>
+    {% for ts, mseq, mid, v in raw_readings %}
+    <tr><td>{{ ts.strftime('%Y-%m-%d %H:%M') }}</td><td>{{ mid }}</td><td>{{ v }}</td></tr>
     {% endfor %}
   </table>
 </div>
 {% endif %}
 
-<form method="post" action="{{ url_for('reset') }}"
-      onreturn="return confirm('确认清空？')">
+<form method="post" action="{{ url_for('reset') }}">
   <button class="ghost" type="submit"
-          onclick="return confirm('确认清空全部读数、参数与结论？')">
-    清空重置</button>
+          onclick="return confirm('确认清空账期？读数与换表记录将一并清空。')">
+    清空账期（含换表记录）</button>
 </form>
 </body>
 </html>

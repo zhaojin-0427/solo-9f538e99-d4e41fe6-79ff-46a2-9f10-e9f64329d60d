@@ -24,6 +24,20 @@ def parse_window_ts(text: str) -> datetime:
     raise AuditInputError("所报时段格式示例：2026-11-01 08:15")
 
 
+def parse_minute(text: str) -> datetime:
+    for fmt in storage.TS_FORMATS:
+        try:
+            dt = datetime.strptime(text.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise AuditInputError("分钟格式示例：2026-11-01 08:15")
+    if dt.second != 0 or dt.microsecond != 0:
+        raise AuditInputError("必须是整分钟")
+    return dt
+
+
 def _positive_int(text: str, label: str) -> int:
     try:
         v = int(str(text).strip())
